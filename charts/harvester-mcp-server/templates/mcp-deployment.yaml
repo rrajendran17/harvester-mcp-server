@@ -1,3 +1,9 @@
+{{- if and (or .Values.direct.kubeconfigSecret .Values.direct.inClusterName) (eq .Values.direct.auth "kubeconfig") (not .Values.apiKey.secret) }}
+{{- fail "direct.auth=kubeconfig gives every caller the kubeconfig's permissions: set apiKey.secret so callers must authenticate" }}
+{{- end }}
+{{- if not (has .Values.direct.auth (list "passthrough" "kubeconfig")) }}
+{{- fail "direct.auth must be passthrough or kubeconfig" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,6 +46,11 @@ spec:
       volumes:
         - name: tmp-dir
           emptyDir: {}
+        {{- if .Values.direct.kubeconfigSecret }}
+        - name: direct-kubeconfig
+          secret:
+            secretName: {{ .Values.direct.kubeconfigSecret }}
+        {{- end }}
       containers:
       - image: "{{ template "system_default_registry" . }}{{ .Values.mcp.image.repository }}:{{ .Values.mcp.image.tag }}"
         imagePullPolicy: "{{ .Values.mcp.image.pullPolicy }}"
@@ -51,9 +62,18 @@ spec:
           capabilities:
             drop:
               - ALL
-        {{- with .Values.mcp.env }}
+        {{- if or .Values.mcp.env .Values.apiKey.secret }}
         env:
+          {{- with .Values.mcp.env }}
           {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- if .Values.apiKey.secret }}
+          - name: MCP_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: {{ .Values.apiKey.secret }}
+                key: {{ .Values.apiKey.secretKey }}
+          {{- end }}
         {{- end }}
         ports:
           - containerPort: 9092
@@ -68,6 +88,21 @@ spec:
           {{- if .Values.mcp.readOnly }}
           - "--read-only"
           {{- end }}
+          {{- if not .Values.rancher.enabled }}
+          - "--disable-rancher"
+          {{- end }}
+          {{- if .Values.direct.kubeconfigSecret }}
+          - "--kubeconfig"
+          - "/etc/harvester-mcp/direct/{{ .Values.direct.kubeconfigSecretKey }}"
+          {{- end }}
+          {{- if .Values.direct.inClusterName }}
+          - "--in-cluster-name"
+          - "{{ .Values.direct.inClusterName }}"
+          {{- end }}
+          {{- if or .Values.direct.kubeconfigSecret .Values.direct.inClusterName }}
+          - "--direct-auth"
+          - "{{ .Values.direct.auth }}"
+          {{- end }}
           {{- if .Values.log.level }}
           - "--log-level"
           - "{{ .Values.log.level }}"
@@ -75,3 +110,8 @@ spec:
         volumeMounts:
           - name: tmp-dir
             mountPath: /tmp
+          {{- if .Values.direct.kubeconfigSecret }}
+          - name: direct-kubeconfig
+            mountPath: /etc/harvester-mcp/direct
+            readOnly: true
+          {{- end }}

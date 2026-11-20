@@ -22,6 +22,7 @@ type toolsClient interface {
 	GetResources(ctx context.Context, params client.ListParams) ([]*unstructured.Unstructured, error)
 	CreateClientSet(ctx context.Context, token string, cluster string) (kubernetes.Interface, error)
 	GetClusterID(ctx context.Context, token string, clusterNameOrID string) (string, error)
+	ListClusters(ctx context.Context, token string, harvesterOnly bool) (*client.ClustersResult, error)
 }
 
 // Tools contains tools for accessing provisioning information.
@@ -39,6 +40,18 @@ func NewTools(client toolsClient, readOnly bool) *Tools {
 }
 
 func (t *Tools) AddTools(mcpServer *mcp.Server) {
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "listClusters",
+		Meta: map[string]any{
+			toolsSetAnn: toolsSet,
+		},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		Description: `Lists the Harvester / SUSE Virtualization clusters this server can access.
+Returns each cluster's name (the value to pass as "cluster" to other tools), its source ("direct" for clusters
+connected without Rancher, "rancher" for clusters imported into Rancher), display name and provider.
+Use this when the user has not said which cluster to use, or asks which clusters are available.`},
+		t.listClusters)
+
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "listVirtualMachines",
 		Meta: map[string]any{

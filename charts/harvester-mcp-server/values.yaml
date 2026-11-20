@@ -11,6 +11,29 @@ mcp:
     pullPolicy: IfNotPresent
 
 insecureSkipTls: false
+
+# Access to Harvester clusters imported into Rancher (via the Rancher API).
+rancher:
+  enabled: true
+
+# Access to Harvester clusters directly, without Rancher.
+direct:
+  # Name of a Secret containing a kubeconfig. Every context in it is served as
+  # a cluster named after the context.
+  kubeconfigSecret: ""
+  kubeconfigSecretKey: kubeconfig
+  # Serve the cluster this chart is installed in (e.g. when installing on a
+  # Harvester cluster) as a direct cluster with this name.
+  inClusterName: ""
+  # passthrough: use the token sent by the caller (keeps per-user RBAC).
+  # kubeconfig:  use the kubeconfig credentials / this chart's service account;
+  #              requires apiKey.secret or OAuth.
+  auth: passthrough
+
+# Shared API key that callers must send in the X-MCP-API-Key header.
+apiKey:
+  secret: ""
+  secretKey: api-key
 seLinux:
   enabled: false
 

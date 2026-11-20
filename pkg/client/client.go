@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/harvester/harvester-mcp-server/pkg/converter"
+	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,10 +25,18 @@ var clusterIdsCache = sync.Map{}
 var clustersDisplayNameToIDCache = sync.Map{}
 
 // Client is a struct that provides methods for interacting with Kubernetes clusters.
+//
+// Clusters are reached either through Rancher (<rancherURL>/k8s/clusters/<id>)
+// or directly, using a kubeconfig context or the in-cluster config. Direct
+// clusters take precedence over Rancher clusters with the same name.
 type Client struct {
-	insecure         bool
-	rancherURL       string
+	insecure   bool
+	rancherURL string
+	// rancherDisabled is set when only direct clusters are served.
+	rancherDisabled  bool
 	caBundle         []byte
+	direct           map[string]*directCluster
+	directAuth       DirectAuthMode
 	DynClientCreator func(*rest.Config) (dynamic.Interface, error)
 	ClientSetCreator func(*rest.Config) (kubernetes.Interface, error)
 }
@@ -52,9 +61,76 @@ type ListParams struct {
 	Limit         int64  // Optional maximum number of resources to return. 0 means no limit.
 }
 
-// NewClient creates and returns a new instance of the Client struct.
+// Options configures a Client.
+type Options struct {
+	// Insecure skips TLS verification for connections to Rancher.
+	Insecure bool
+	// AuthzServerURL is the OAuth authorization server URL; when set, the
+	// Rancher URL is derived from it.
+	AuthzServerURL string
+	// DisableRancher turns off Rancher entirely; only direct clusters are served.
+	DisableRancher bool
+	// Kubeconfigs are kubeconfig files whose contexts are served as direct
+	// clusters, named after the context.
+	Kubeconfigs []string
+	// InClusterName, if set, serves the cluster the server runs in as a
+	// direct cluster with this name.
+	InClusterName string
+	// DirectAuth selects the credentials used for direct clusters.
+	DirectAuth DirectAuthMode
+}
+
+// NewClient creates and returns a new instance of the Client struct that
+// resolves clusters through Rancher.
 func NewClient(insecure bool, authzServerURL string) (*Client, error) {
-	rancherURL, err := rancherURLFromAuthServerURL(authzServerURL)
+	return NewClientWithOptions(Options{Insecure: insecure, AuthzServerURL: authzServerURL})
+}
+
+// NewClientWithOptions creates a Client. Rancher is used unless disabled. If
+// direct clusters are configured and the Rancher URL cannot be discovered
+// automatically, the client runs in direct-only mode.
+func NewClientWithOptions(opts Options) (*Client, error) {
+	directAuth, err := ParseDirectAuthMode(string(opts.DirectAuth))
+	if err != nil {
+		return nil, err
+	}
+
+	direct, err := loadKubeconfigClusters(opts.Kubeconfigs)
+	if err != nil {
+		return nil, err
+	}
+	if opts.InClusterName != "" {
+		if _, dup := direct[opts.InClusterName]; dup {
+			return nil, fmt.Errorf("in-cluster name %q conflicts with a kubeconfig context", opts.InClusterName)
+		}
+		cfg, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("loading in-cluster config for %q: %w", opts.InClusterName, err)
+		}
+		direct[opts.InClusterName] = &directCluster{name: opts.InClusterName, origin: "in-cluster", config: cfg}
+	}
+
+	c := &Client{
+		insecure:   opts.Insecure,
+		direct:     direct,
+		directAuth: directAuth,
+		DynClientCreator: func(cfg *rest.Config) (dynamic.Interface, error) {
+			return dynamic.NewForConfig(cfg)
+		},
+		ClientSetCreator: func(cfg *rest.Config) (kubernetes.Interface, error) {
+			return kubernetes.NewForConfig(cfg)
+		},
+	}
+
+	if opts.DisableRancher {
+		if len(direct) == 0 {
+			return nil, fmt.Errorf("rancher is disabled and no direct clusters are configured")
+		}
+		c.rancherDisabled = true
+		return c, nil
+	}
+
+	rancherURL, err := rancherURLFromAuthServerURL(opts.AuthzServerURL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing authz-server-url: %w", err)
 	}
@@ -64,28 +140,23 @@ func NewClient(insecure bool, authzServerURL string) (*Client, error) {
 		} else {
 			rancherURL, err = fetchRancherURL()
 			if err != nil {
+				if len(direct) > 0 {
+					zap.L().Warn("Rancher URL could not be discovered; serving direct clusters only", zap.Error(err))
+					c.rancherDisabled = true
+					return c, nil
+				}
 				return nil, fmt.Errorf("fetching internal-server-url from rancher: %w", err)
 			}
 		}
 	}
-	var caBundle []byte
-	if !insecure {
-		caBundle, err = fetchCABundle()
+	if !opts.Insecure {
+		c.caBundle, err = fetchCABundle()
 		if err != nil {
 			return nil, fmt.Errorf("fetching internal-cacerts from rancher: %w", err)
 		}
 	}
-	return &Client{
-		caBundle:   caBundle,
-		insecure:   insecure,
-		rancherURL: rancherURL,
-		DynClientCreator: func(cfg *rest.Config) (dynamic.Interface, error) {
-			return dynamic.NewForConfig(cfg)
-		},
-		ClientSetCreator: func(cfg *rest.Config) (kubernetes.Interface, error) {
-			return kubernetes.NewForConfig(cfg)
-		},
-	}, nil
+	c.rancherURL = rancherURL
+	return c, nil
 }
 
 func (c *Client) RancherURL() string {
@@ -94,11 +165,7 @@ func (c *Client) RancherURL() string {
 
 // CreateClientSet creates a new Kubernetes clientset for the given Token and URL.
 func (c *Client) CreateClientSet(ctx context.Context, token string, cluster string) (kubernetes.Interface, error) {
-	clusterID, err := c.GetClusterID(ctx, token, cluster)
-	if err != nil {
-		return nil, err
-	}
-	restConfig, err := c.CreateRestConfig(token, clusterID)
+	restConfig, err := c.restConfigFor(ctx, token, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -108,11 +175,7 @@ func (c *Client) CreateClientSet(ctx context.Context, token string, cluster stri
 
 // GetResourceInterface returns a dynamic resource interface for the given Token, URL, Namespace, and GroupVersionResource.
 func (c *Client) GetResourceInterface(ctx context.Context, token string, namespace string, cluster string, gvr schema.GroupVersionResource) (dynamic.ResourceInterface, error) {
-	clusterID, err := c.GetClusterID(ctx, token, cluster)
-	if err != nil {
-		return nil, err
-	}
-	restConfig, err := c.CreateRestConfig(token, clusterID)
+	restConfig, err := c.restConfigFor(ctx, token, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +361,14 @@ func (c *Client) GetResourcesAtAnyAPIVersion(ctx context.Context, params ListPar
 //
 // both cluster ID and display name are cached for future lookups.
 func (c *Client) GetClusterID(ctx context.Context, token string, clusterNameOrID string) (string, error) {
+	// direct clusters are identified by their configured name
+	if c.isDirect(clusterNameOrID) {
+		return clusterNameOrID, nil
+	}
+	if !c.RancherEnabled() {
+		return "", c.unknownClusterError(clusterNameOrID)
+	}
+
 	// handle the special case for the local cluster, it always exists and is known by ID and displayName "local"
 	if clusterNameOrID == "local" {
 		return "local", nil
@@ -413,11 +484,7 @@ func (c *Client) CreateRestConfig(token string, clusterID string) (*rest.Config,
 // getAPIVersionsForGR queries the API server for all supported versions of the specified GroupResource.
 // It returns a slice of version strings or an error if the query fails.
 func (c *Client) getAPIVersionsForGR(ctx context.Context, token, cluster string, groupResource schema.GroupResource) ([]string, error) {
-	clusterID, err := c.GetClusterID(ctx, token, cluster)
-	if err != nil {
-		return nil, err
-	}
-	restConfig, err := c.CreateRestConfig(token, clusterID)
+	restConfig, err := c.restConfigFor(ctx, token, cluster)
 	if err != nil {
 		return nil, err
 	}

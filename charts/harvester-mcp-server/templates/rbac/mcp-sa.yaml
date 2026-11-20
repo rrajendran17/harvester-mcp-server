@@ -3,6 +3,7 @@ kind: ServiceAccount
 metadata:
   name: harvester-mcp-cert-rotator-sa
   namespace: {{ .Release.Namespace }}
+{{- if .Values.rancher.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -26,6 +27,7 @@ subjects:
 - kind: ServiceAccount
   name: harvester-mcp-cert-rotator-sa
   namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 {{- if not .Values.insecureSkipTls }}
 apiVersion: rbac.authorization.k8s.io/v1

@@ -1,0 +1,73 @@
+{{- if and .Values.direct.inClusterName (eq .Values.direct.auth "kubeconfig") }}
+# Permissions used for the in-cluster direct target when direct.auth=kubeconfig.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: harvester-mcp-direct-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "persistentvolumeclaims"]
+  verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachines"]
+  verbs: ["get", "list"]
+- apiGroups: ["harvesterhci.io"]
+  resources: ["virtualmachineimages"]
+  verbs: ["get", "list"]
+- apiGroups: ["k8s.cni.cncf.io"]
+  resources: ["network-attachment-definitions"]
+  verbs: ["get", "list"]
+- apiGroups: ["network.harvesterhci.io"]
+  resources: ["clusternetworks"]
+  verbs: ["get", "list"]
+- apiGroups: ["longhorn.io"]
+  resources: ["volumes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: harvester-mcp-direct-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: harvester-mcp-direct-reader
+subjects:
+- kind: ServiceAccount
+  name: harvester-mcp-cert-rotator-sa
+  namespace: {{ .Release.Namespace }}
+{{- if not .Values.mcp.readOnly }}
+---
+# Write tools (createVirtualMachine, createVirtualMachineImage, deleteVirtualMachine).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: harvester-mcp-direct-writer
+rules:
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachines"]
+  verbs: ["create", "delete"]
+- apiGroups: ["harvesterhci.io"]
+  resources: ["virtualmachineimages"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: harvester-mcp-direct-writer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: harvester-mcp-direct-writer
+subjects:
+- kind: ServiceAccount
+  name: harvester-mcp-cert-rotator-sa
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
